@@ -68,6 +68,20 @@ predictions = model.predict(sequences)
 print(f"Predicted Indel: {predictions[0]}")
 ```
 
+### Running Examples
+
+Run the example script to see various usage patterns:
+
+```bash
+python example_usage.py
+```
+
+This will demonstrate:
+- Basic model usage for predictions
+- Batch prediction on multiple sequences
+- Understanding the tokenizer
+- Training a model from scratch (optional)
+
 ### Custom Training
 
 You can customize training parameters:
@@ -105,9 +119,11 @@ The trained model provides:
 .
 ├── 34bp.xlsx                  # Input data
 ├── bert_dna_model.py          # Main model implementation
+├── train_model.py             # Training script
+├── example_usage.py           # Usage examples
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
-└── dna_bert_model/           # Trained model directory
+└── dna_bert_model/           # Trained model directory (after training)
     ├── config.json
     ├── model.safetensors
     └── tokenizer_vocab.json
