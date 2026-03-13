@@ -11,6 +11,10 @@ from torch.utils.data import DataLoader
 from model import CasBertConfig, CasBertModel, CasNucleotideTokenizer, CasSequenceDataset
 from normalizer import Normalizer
 
+VARIANT_COL = "variant"
+ORIGINAL_VARIANT = "original"
+REPLACED_VARIANT = "replaced"
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -73,6 +77,7 @@ def load_and_prepare_data(
     df = df[[sequence_col, label_col, z_label_col]].dropna().copy()
     df[sequence_col] = df[sequence_col].astype(str).str.strip()
     df[label_col] = pd.to_numeric(df[label_col], errors="coerce")
+    df[z_label_col] = pd.to_numeric(df[z_label_col], errors="coerce")
     df = df.dropna().reset_index(drop=True)
 
     allowed_chars = set("ATGCZatgcz")
@@ -86,7 +91,38 @@ def load_and_prepare_data(
         )
 
     train_df, val_df, test_df = split_dataframe_8_1_1(df, seed=seed)
-    return {"train": train_df, "val": val_df, "test": test_df}
+    return {
+        "train": _augment_split_with_replaced_sequences(
+            train_df, sequence_col, label_col, z_label_col
+        ),
+        "val": _augment_split_with_replaced_sequences(
+            val_df, sequence_col, label_col, z_label_col
+        ),
+        "test": _augment_split_with_replaced_sequences(
+            test_df, sequence_col, label_col, z_label_col
+        ),
+    }
+
+
+def _augment_split_with_replaced_sequences(
+    split_df: pd.DataFrame,
+    sequence_col: str,
+    label_col: str,
+    z_label_col: str,
+) -> pd.DataFrame:
+    original_df = split_df.copy()
+    original_df[VARIANT_COL] = ORIGINAL_VARIANT
+
+    replaced_df = split_df.copy()
+    replaced_df[sequence_col] = (
+        replaced_df[sequence_col]
+        .str.replace("a", "z", regex=False)
+        .str.replace("A", "Z", regex=False)
+    )
+    replaced_df[label_col] = replaced_df[z_label_col]
+    replaced_df[VARIANT_COL] = REPLACED_VARIANT
+
+    return pd.concat([original_df, replaced_df], ignore_index=True)
 
 
 def apply_label_normalization(
@@ -113,39 +149,44 @@ def build_dataloaders(
     label_col: str,
     num_workers: int,
 ) -> Dict[str, DataLoader]:
-    datasets = {}
-    for split_name, split_df in splits.items():
-        datasets[split_name] = CasSequenceDataset(
+    def _build_loader(split_df: pd.DataFrame, shuffle: bool) -> DataLoader:
+        dataset = CasSequenceDataset(
             sequences=split_df[sequence_col].tolist(),
             y_values=split_df[label_col].astype(float).tolist(),
             tokenizer=tokenizer,
             max_len=max_len,
         )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
 
-    use_pin_memory = torch.cuda.is_available()
-    return {
-        "train": DataLoader(
-            datasets["train"],
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=use_pin_memory,
-        ),
-        "val": DataLoader(
-            datasets["val"],
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=use_pin_memory,
-        ),
-        "test": DataLoader(
-            datasets["test"],
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=use_pin_memory,
-        ),
+    dataloaders = {
+        "train": _build_loader(splits["train"], shuffle=True),
+        "val": _build_loader(splits["val"], shuffle=False),
+        "test": _build_loader(splits["test"], shuffle=False),
     }
+
+    for split_name in ["val", "test"]:
+        split_df = splits[split_name]
+        if VARIANT_COL not in split_df.columns:
+            continue
+
+        for variant_name in [ORIGINAL_VARIANT, REPLACED_VARIANT]:
+            variant_df = split_df[split_df[VARIANT_COL] == variant_name].reset_index(
+                drop=True
+            )
+            if len(variant_df) == 0:
+                continue
+            dataloaders[f"{split_name}_{variant_name}"] = _build_loader(
+                variant_df,
+                shuffle=False,
+            )
+
+    return dataloaders
 
 
 def _move_batch_to_device(
@@ -382,6 +423,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", type=Path, default=Path("data/Z_gRNA.csv"))
     parser.add_argument("--sequence-col", type=str, default="sequence")
     parser.add_argument("--label-col", type=str, default="efficiency")
+    parser.add_argument("--z-label-col", type=str, default="Z-avg")
     parser.add_argument(
         "--normalizer",
         type=Path,
@@ -473,6 +515,7 @@ def main() -> None:
         path=args.data,
         sequence_col=args.sequence_col,
         label_col=args.label_col,
+        z_label_col=args.z_label_col,
         seed=args.seed,
     )
 
@@ -523,9 +566,20 @@ def main() -> None:
 
     print(f"Pretrained checkpoint: {args.pretrained}")
     print(f"Finetune data: {args.data}")
+    train_original_size = int(
+        (splits_raw["train"][VARIANT_COL] == ORIGINAL_VARIANT).sum()
+    )
+    val_original_size = int((splits_raw["val"][VARIANT_COL] == ORIGINAL_VARIANT).sum())
+    test_original_size = int(
+        (splits_raw["test"][VARIANT_COL] == ORIGINAL_VARIANT).sum()
+    )
     print(
-        "Split sizes (8/1/1): "
+        "Split sizes after doubling (train/val/test): "
         f"{len(splits_raw['train'])}/{len(splits_raw['val'])}/{len(splits_raw['test'])}"
+    )
+    print(
+        "Original counts before doubling (train/val/test): "
+        f"{train_original_size}/{val_original_size}/{test_original_size}"
     )
     print(f"Device: {device}")
     print(f"Trainable parameters (head-only): {trainable_params:,}/{total_params:,}")
@@ -552,15 +606,36 @@ def main() -> None:
             problem_type=args.problem_type,
             normalizer=normalizer,
         )
+        val_original_metrics = evaluate(
+            model=model,
+            dataloader=dataloaders["val_original"],
+            device=device,
+            problem_type=args.problem_type,
+            normalizer=normalizer,
+        )
+        val_replaced_metrics = evaluate(
+            model=model,
+            dataloader=dataloaders["val_replaced"],
+            device=device,
+            problem_type=args.problem_type,
+            normalizer=normalizer,
+        )
 
         row: Dict[str, float] = {"epoch": float(epoch), "train_loss": float(train_loss)}
         for k, v in val_metrics.items():
             row[f"val_{k}"] = float(v)
+        for k, v in val_original_metrics.items():
+            row[f"val_original_{k}"] = float(v)
+        for k, v in val_replaced_metrics.items():
+            row[f"val_replaced_{k}"] = float(v)
         history.append(row)
 
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
-            f"train_loss={train_loss:.6f} | val: {_format_metrics(val_metrics)}"
+            f"train_loss={train_loss:.6f} | "
+            f"val(all): {_format_metrics(val_metrics)} | "
+            f"val(original): {_format_metrics(val_original_metrics)} | "
+            f"val(replaced): {_format_metrics(val_replaced_metrics)}"
         )
 
         if val_metrics["loss"] < best_val_loss:
@@ -616,15 +691,33 @@ def main() -> None:
         problem_type=args.problem_type,
         normalizer=normalizer,
     )
+    test_original_metrics = evaluate(
+        model=model,
+        dataloader=dataloaders["test_original"],
+        device=device,
+        problem_type=args.problem_type,
+        normalizer=normalizer,
+    )
+    test_replaced_metrics = evaluate(
+        model=model,
+        dataloader=dataloaders["test_replaced"],
+        device=device,
+        problem_type=args.problem_type,
+        normalizer=normalizer,
+    )
     print(f"Best validation metric: {best_metric:.6f}")
     print(f"Best model epoch: {best_metric_epoch}")
     best_metric_path = run_dir / "best_metric.txt"
     print(f"Saved best validation metric to: {best_metric_path}")
-    print(f"Test metrics: {_format_metrics(test_metrics)}")
+    print(f"Test metrics (all): {_format_metrics(test_metrics)}")
+    print(f"Test metrics (original): {_format_metrics(test_original_metrics)}")
+    print(f"Test metrics (replaced): {_format_metrics(test_replaced_metrics)}")
     with best_metric_path.open("w") as f:
         f.write(f"{best_metric:.6f}")
         f.write(f"\nBest model epoch: {best_metric_epoch}\n")
-        f.write(f"Test metrics: {_format_metrics(test_metrics)}\n")
+        f.write(f"Test metrics (all): {_format_metrics(test_metrics)}\n")
+        f.write(f"Test metrics (original): {_format_metrics(test_original_metrics)}\n")
+        f.write(f"Test metrics (replaced): {_format_metrics(test_replaced_metrics)}\n")
 
 
 if __name__ == "__main__":
