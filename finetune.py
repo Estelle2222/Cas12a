@@ -266,6 +266,27 @@ def freeze_all_but_prediction_head(model: CasBertModel) -> Tuple[int, int]:
     return trainable_params, total_params
 
 
+def copy_token_embedding(model: CasBertModel, source_token_id: int, target_token_id: int) -> None:
+    with torch.no_grad():
+        model.token_embeddings.weight[target_token_id].copy_(
+            model.token_embeddings.weight[source_token_id]
+        )
+
+
+def enable_single_token_embedding_training(
+    model: CasBertModel, token_id: int
+) -> Tuple[torch.utils.hooks.RemovableHandle, int]:
+    emb_weight = model.token_embeddings.weight
+    emb_weight.requires_grad = True
+
+    grad_mask = torch.zeros_like(emb_weight)
+    grad_mask[token_id] = 1.0
+
+    hook = emb_weight.register_hook(lambda grad: grad * grad_mask)
+    trainable_dims = int(emb_weight.shape[1])
+    return hook, trainable_dims
+
+
 def set_head_only_train_mode(model: CasBertModel) -> None:
     # Keep frozen backbone in eval mode (no dropout updates), head in train mode.
     model.eval()
@@ -296,7 +317,9 @@ def train_one_epoch_head_only(
         loss.backward()
 
         if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.prediction_head.parameters(), grad_clip)
+            clip_params = [p for p in model.parameters() if p.requires_grad]
+            if clip_params:
+                torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
         optimizer.step()
 
         bs = batch["labels"].shape[0]
@@ -504,12 +527,30 @@ def main() -> None:
     if load_msg.unexpected_keys:
         print(f"Unexpected keys while loading pretrained model: {load_msg.unexpected_keys}")
 
-    trainable_params, total_params = freeze_all_but_prediction_head(model)
-    optimizer = torch.optim.AdamW(
-        (p for p in model.parameters() if p.requires_grad),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+    head_trainable_params, total_params = freeze_all_but_prediction_head(model)
+    a_token_id = tokenizer.vocab["a"]
+    z_token_id = tokenizer.vocab["z"]
+    copy_token_embedding(model, source_token_id=a_token_id, target_token_id=z_token_id)
+    z_embedding_hook, z_trainable_dims = enable_single_token_embedding_training(
+        model, token_id=z_token_id
     )
+    trainable_params = head_trainable_params + z_trainable_dims
+
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": list(model.prediction_head.parameters()),
+                "weight_decay": args.weight_decay,
+            },
+            {
+                # Keep weight decay off for embedding matrix since only one row is trainable.
+                "params": [model.token_embeddings.weight],
+                "weight_decay": 0.0,
+            },
+        ],
+        lr=args.lr,
+    )
+    _ = z_embedding_hook
 
     splits_raw = load_and_prepare_data(
         path=args.data,
@@ -582,8 +623,9 @@ def main() -> None:
         f"{train_original_size}/{val_original_size}/{test_original_size}"
     )
     print(f"Device: {device}")
-    print(f"Trainable parameters (head-only): {trainable_params:,}/{total_params:,}")
-
+    print(f"Trainable parameters (head + z-token embedding): {trainable_params:,}/{total_params:,}")
+    print(f"Initialized embedding 'z' from 'a' (token ids: a={a_token_id}, z={z_token_id})")
+    import sys; sys.exit(0)
     best_metric = float("inf") if args.problem_type == "regression" else float("-inf")
     best_model_path = run_dir / "best_model.pt"
     history: List[Dict[str, float]] = []
