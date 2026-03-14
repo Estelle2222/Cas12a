@@ -128,6 +128,7 @@ def _augment_split_with_replaced_sequences(
 def apply_label_normalization(
     splits: Dict[str, pd.DataFrame],
     label_col: str,
+    z_label_col: str,
     normalizer: Normalizer,
 ) -> Dict[str, pd.DataFrame]:
     normalized_splits: Dict[str, pd.DataFrame] = {}
@@ -136,6 +137,15 @@ def apply_label_normalization(
         split_copy[label_col] = normalizer.normalize(
             split_copy[label_col].astype(float).to_numpy()
         )
+        if z_label_col in split_copy.columns:
+            split_copy[z_label_col] = normalizer.normalize(
+                split_copy[z_label_col].astype(float).to_numpy()
+            )
+            if VARIANT_COL in split_copy.columns:
+                replaced_mask = split_copy[VARIANT_COL] == REPLACED_VARIANT
+                split_copy.loc[replaced_mask, label_col] = split_copy.loc[
+                    replaced_mask, z_label_col
+                ]
         normalized_splits[split_name] = split_copy
     return normalized_splits
 
@@ -573,6 +583,7 @@ def main() -> None:
         splits_for_training = apply_label_normalization(
             splits=splits_raw,
             label_col=args.label_col,
+            z_label_col=args.z_label_col,
             normalizer=normalizer,
         )
         print(
@@ -625,13 +636,13 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Trainable parameters (head + z-token embedding): {trainable_params:,}/{total_params:,}")
     print(f"Initialized embedding 'z' from 'a' (token ids: a={a_token_id}, z={z_token_id})")
-    import sys; sys.exit(0)
+
     best_metric = float("inf") if args.problem_type == "regression" else float("-inf")
     best_model_path = run_dir / "best_model.pt"
     history: List[Dict[str, float]] = []
     best_val_loss = float("inf")
     no_improve_epochs = 0
-    early_stop_patience = 10
+    early_stop_patience = 20
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch_head_only(
